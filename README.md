@@ -1,6 +1,6 @@
 # sdsh — Super Duper Shell
 
-**Version:** 1.2
+**Version:** 1.3
 **Publisher:** ARPHA11 OPS
 **Target platform:** Ubuntu / KDE Neon (Konsole terminal)
 **License:** BSD 2-Clause "Simplified" License
@@ -69,6 +69,14 @@ run commands.
 - **Graceful error messages** — unknown commands, failed `fork()`/`exec()`
   calls, and bad `cd` targets are reported clearly instead of crashing.
 - **Comment support in scripts** — lines beginning with `#` are ignored.
+- **`~/.sdshrc` config file** — automatically sourced at startup (interactive
+  or script mode) before anything else runs; missing file is not an error;
+  pass `--norc` to skip it.
+- **Any script extension** — `sdsh script.sdsh`, `sdsh script.dsh`, and
+  `sdsh script.sh` all work identically; the extension is a naming
+  convention only, sdsh just reads the file line-by-line.
+- **Tilde expansion in `cd`** — `cd ~` and `cd ~/path` work in both
+  interactive input and scripts.
 
 ## Requirements
 
@@ -113,7 +121,13 @@ without an interactive prompt:
 
 ```bash
 ./sdsh script.sdsh
+./sdsh script.dsh
+./sdsh script.sh
 ```
+
+Any filename or extension works — `sdsh` doesn't inspect it, it just opens
+the file and reads lines. `.sdsh`/`.dsh`/`.sh` are naming conventions, not
+requirements.
 
 Script files:
 - Are read one line at a time.
@@ -121,6 +135,17 @@ Script files:
 - Execute the same translation/built-in/external dispatch logic as
   interactive mode.
 - Stop early if a line runs the `exit` built-in.
+- A missing script file is a **fatal error** (`sdsh` prints a message and
+  exits with status 1) — this is a script you explicitly asked to run.
+
+### Command-line flags
+
+| Flag      | Effect                                              |
+|-----------|-------------------------------------------------------|
+| `--norc`  | Skip auto-sourcing `~/.sdshrc` (works in either mode) |
+
+`--norc` may appear before or after a script path, e.g. both
+`sdsh --norc script.sh` and `sdsh script.sh --norc` are valid.
 
 ## Command Reference
 
@@ -197,12 +222,38 @@ The prompt is rendered as:
 Each segment is colored independently using ANSI escape codes for
 readability in Konsole and other VT100-compatible terminals.
 
-## Scripting with `.sdsh` Files
+## Config File (`~/.sdshrc`)
 
-A script is simply a plain text file containing one `sdsh` command per line:
+If `~/.sdshrc` exists, `sdsh` automatically runs it — line-by-line, using the
+exact same execution path as a script — **before** the interactive prompt
+appears or a requested script starts running.
+
+- Runs in both interactive and script-invocation modes.
+- Missing `~/.sdshrc` is completely normal; nothing is printed.
+- Any other open failure (e.g. permission denied) is reported to `stderr`
+  but is **not fatal** — `sdsh` continues starting up.
+- Uses the same syntax as any other `sdsh` script: one command per line,
+  `#` comments, blank lines ignored.
+- Runs relative to whatever directory `sdsh` was launched from — it's a
+  startup script, not a directory-context loader.
+- Skip it entirely with `sdsh --norc`.
+
+Example `~/.sdshrc`:
 
 ```sdsh
-# Example: setup.sdsh
+# Personal sdsh startup file
+about
+cd ~/projects
+whereami
+```
+
+## Scripting with Script Files
+
+A script is simply a plain text file containing one `sdsh` command per line.
+Any extension works — `.sdsh`, `.dsh`, `.sh`, or none at all:
+
+```sdsh
+# Example: setup.sdsh  (or setup.dsh, or setup.sh, or just "setup")
 refresh
 grab git
 newfolder ~/projects
@@ -210,14 +261,18 @@ cd ~/projects
 whereami
 ```
 
-Run it with:
+Run it with any of:
 
 ```bash
 ./sdsh setup.sdsh
+./sdsh setup.dsh
+./sdsh setup.sh
 ```
 
 Comments (`#`) and blank lines are ignored. Execution stops if a line
-triggers the `exit` built-in or the end of the file is reached.
+triggers the `exit` built-in or the end of the file is reached. Note that
+`~/.sdshrc` (if present) runs *before* the script itself, unless `--norc`
+is passed.
 
 ## Signal Handling
 
@@ -243,7 +298,20 @@ triggers the `exit` built-in or the end of the file is reached.
 
 ## Architecture Notes
 
-The command pipeline for each input line is:
+**Startup sequence** (`main()`):
+
+1. Install the `SIGINT` handler.
+2. Parse arguments for `--norc` and an optional script path.
+3. Unless `--norc` was given, call `sdsh_load_rc()`, which resolves
+   `$HOME/.sdshrc` (falling back to `getpwuid()->pw_dir` if `$HOME` is
+   unset) and runs it via `sdsh_run_script()` with `must_exist = 0`
+   (missing file is not an error).
+4. If a script path was given, run it via `sdsh_run_script()` with
+   `must_exist = 1` (missing file *is* a fatal error). Otherwise, enter
+   `sdsh_repl()`.
+
+**Per-line command pipeline** (`sdsh_execute()`), used identically for
+interactive input, `~/.sdshrc`, and script files:
 
 1. **Trim** — strip leading/trailing whitespace; skip blank lines and
    `#`-comments.
@@ -258,13 +326,19 @@ The command pipeline for each input line is:
      table; unrecognized commands pass through unchanged.
 4. **Dispatch** — built-ins are checked first (`sdsh_run_builtin`); if the
    command isn't a built-in, it's executed externally via
-   `fork()` + `execvp()` + `waitpid()` (`sdsh_run_external`).
+   `fork()` + `execvp()` + `waitpid()` (`sdsh_run_external`). The `cd`
+   built-in expands a leading `~` or `~/path` via `sdsh_expand_tilde()`
+   before calling `chdir()`.
+
+`sdsh_run_script()` backs both script execution and rc-file loading — the
+only difference is the `must_exist` flag, which controls whether a missing
+file is fatal (explicit script) or silently ignored (optional rc file).
 
 Key compile-time constants (`sdsh.c`):
 
 | Constant           | Value | Purpose                                |
 |---------------------|-------|-------------------------------------------|
-| `SDSH_VERSION`      | `1.2` | Version string shown in `about`        |
+| `SDSH_VERSION`      | `1.3` | Version string shown in `about`        |
 | `SDSH_MAX_ARGS`     | `128` | Max tokens per command line              |
 | `SDSH_MAX_LINE`     | `4096`| Max characters per input line            |
 | `SDSH_CWD_MAX`      | `1024`| Max path length shown in the prompt      |
@@ -274,9 +348,13 @@ Key compile-time constants (`sdsh.c`):
 - No support for shell pipelines (`|`), redirection (`>`, `<`), or command
   chaining (`&&`, `;`) — each line is treated as a single command.
 - No command history or tab-completion.
-- No environment variable expansion beyond what `execvp()`/`getenv()`
-  provide natively (e.g. `$HOME` resolution for bare `cd`).
+- No environment variable expansion (e.g. `$MYVAR`) beyond what
+  `execvp()`/`getenv()` provide natively; only `~`/`~/path` is expanded,
+  and only for `cd`.
 - Alias tables are static and require recompilation to extend.
+- `~/.sdshrc` is a flat startup script, not a key/value settings file —
+  there's no dedicated syntax for things like custom aliases or colors;
+  it can only run `sdsh` commands.
 - Designed and tested primarily for Ubuntu / KDE Neon; other distributions
   or terminals may render ANSI colors differently.
 
