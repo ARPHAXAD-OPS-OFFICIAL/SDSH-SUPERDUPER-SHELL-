@@ -1,7 +1,7 @@
 /*
  * =============================================================================
  *  sdsh — Super Duper Shell
- *  Version: 1.1
+ *  Version: 1.3
  *  Target:  Ubuntu / KDE Neon (Konsole terminal)
  *
  *  Build:
@@ -9,9 +9,21 @@
  *
  *  Usage (interactive):
  *    ./sdsh
+ *    ./sdsh --norc          # skip loading ~/.sdshrc
  *
  *  Usage (scripting):
  *    ./sdsh script.sdsh
+ *    ./sdsh script.dsh
+ *    ./sdsh script.sh
+ *    ./sdsh path/to/script --norc
+ *    (any filename/extension works — sdsh just reads it line-by-line;
+ *     .sdsh/.dsh/.sh are naming conventions only, not enforced)
+ *
+ *  Config file:
+ *    ~/.sdshrc is automatically sourced (if present) before the REPL or a
+ *    script starts running, exactly like a normal script — good for
+ *    startup cd's, custom env, or a login banner. Missing ~/.sdshrc is not
+ *    an error. Pass --norc to skip it.
  *
  *  Features
  *  --------
@@ -24,9 +36,12 @@
  *      Privilege:   superuser <cmd> → sudo <cmd>
  *  • Built-ins:             about, cls, cd, whereami, exit
  *  • External pass-through: execvp() for everything else
- *  • Script execution:      reads & runs .sdsh files line-by-line
- *  • Signal handling:       Ctrl+C clears the line instead of killing sdsh
- *  • Graceful error msgs:   unknown commands, fork failures, etc.
+ *  • Config file:            ~/.sdshrc auto-sourced at startup (--norc to skip)
+ *  • Script execution:       reads & runs script files line-by-line
+ *                            (any extension — .sdsh, .dsh, .sh, or none)
+ *  • Tilde expansion:        cd ~ and cd ~/path both work, in scripts too
+ *  • Signal handling:        Ctrl+C clears the line instead of killing sdsh
+ *  • Graceful error msgs:    unknown commands, fork failures, etc.
  * =============================================================================
  */
 
@@ -45,7 +60,7 @@
 #include <ctype.h>        /* isspace                                          */
 
 /* ── Compile-time constants ───────────────────────────────────────────────── */
-#define SDSH_VERSION     "1.2"
+#define SDSH_VERSION     "1.3"
 #define SDSH_MAX_ARGS    128      /* max tokens in a single command line      */
 #define SDSH_MAX_LINE    4096     /* max characters per input line            */
 #define SDSH_CWD_MAX     1024     /* max path length shown in prompt          */
@@ -65,12 +80,14 @@ static void  sdsh_sigint_handler(int sig);
 static void  sdsh_print_prompt(void);
 static void  sdsh_print_about(void);
 static char *sdsh_trim(char *s);
+static char *sdsh_expand_tilde(const char *path, char *buf, size_t bufsz);
 static int   sdsh_tokenize(char *line, char **argv, int max_args);
 static const char *sdsh_translate(const char *cmd);
 static int   sdsh_run_builtin(char **argv, int argc);
 static void  sdsh_run_external(char **argv);
 static void  sdsh_execute(char *line);
-static void  sdsh_run_script(const char *path);
+static void  sdsh_run_script(const char *path, int must_exist);
+static void  sdsh_load_rc(void);
 static void  sdsh_repl(void);
 
 /* ── Global flag: set by SIGINT handler so the REPL can redraw the prompt ── */
@@ -179,6 +196,12 @@ static void sdsh_print_about(void)
         "\n"
         "   ── Built-in Commands ──────────────────────────────────\n"
         "     about   whereami   cls   cd   exit\n"
+        "     (cd supports ~ and ~/path expansion)\n"
+        "\n"
+        "   ── Config & Scripting ─────────────────────────────────\n"
+        "     ~/.sdshrc          auto-sourced at startup (--norc to skip)\n"
+        "     sdsh <file>        run any script file line-by-line\n"
+        "                        (.sdsh, .dsh, .sh — extension optional)\n"
         COL_RESET "\n");
 }
 
@@ -209,6 +232,61 @@ static char *sdsh_trim(char *s)
     *(end + 1) = '\0';
 
     return s;
+}
+
+/*
+ * sdsh_expand_tilde
+ * -----------------
+ * Expands a leading "~" or "~/..." in `path` into the caller's home
+ * directory, writing the result into `buf` (size `bufsz`) and returning
+ * `buf`. Only a *leading* tilde is special-cased (the common shell
+ * convention: "~user" expansion is intentionally NOT supported).
+ *
+ * If `path` doesn't start with "~", or the home directory can't be
+ * resolved, or the expansion wouldn't fit in `buf`, the original `path`
+ * is copied into `buf` unchanged (best-effort fallback) and returned.
+ */
+static char *sdsh_expand_tilde(const char *path, char *buf, size_t bufsz)
+{
+    if (!path || !buf || bufsz == 0)
+        return buf;
+
+    if (path[0] != '~') {
+        strncpy(buf, path, bufsz - 1);
+        buf[bufsz - 1] = '\0';
+        return buf;
+    }
+
+    /* "~" alone, or "~/rest..." — both use $HOME / pw_dir as the base. */
+    const char *rest = path + 1;   /* text after the '~' */
+    if (*rest != '\0' && *rest != '/') {
+        /* Something like "~otheruser" — not supported; pass through. */
+        strncpy(buf, path, bufsz - 1);
+        buf[bufsz - 1] = '\0';
+        return buf;
+    }
+
+    const char *home = getenv("HOME");
+    if (!home || *home == '\0') {
+        struct passwd *pw = getpwuid(getuid());
+        home = (pw && pw->pw_dir) ? pw->pw_dir : NULL;
+    }
+
+    if (!home) {
+        /* No home directory known; fall back to the literal path. */
+        strncpy(buf, path, bufsz - 1);
+        buf[bufsz - 1] = '\0';
+        return buf;
+    }
+
+    int written = snprintf(buf, bufsz, "%s%s", home, rest);
+    if (written < 0 || (size_t)written >= bufsz) {
+        /* Expansion didn't fit; fall back to the literal path. */
+        strncpy(buf, path, bufsz - 1);
+        buf[bufsz - 1] = '\0';
+    }
+
+    return buf;
 }
 
 /*
@@ -342,6 +420,7 @@ static int sdsh_run_builtin(char **argv, int argc)
     /* ── cd ─────────────────────────────────────────────────────────────── */
     if (strcmp(cmd, "cd") == 0) {
         const char *target;
+        char expanded[SDSH_CWD_MAX];
 
         if (argc < 2 || argv[1] == NULL) {
             /* No argument → go to $HOME */
@@ -351,7 +430,10 @@ static int sdsh_run_builtin(char **argv, int argc)
                 target = pw ? pw->pw_dir : "/";
             }
         } else {
-            target = argv[1];
+            /* Expand a leading "~" (e.g. "cd ~/projects") — sdsh reads raw
+             * user input directly, so unlike a real login shell nothing
+             * upstream has expanded this for us. */
+            target = sdsh_expand_tilde(argv[1], expanded, sizeof(expanded));
         }
 
         if (chdir(target) != 0) {
@@ -585,17 +667,33 @@ static void sdsh_execute(char *line)
 /*
  * sdsh_run_script
  * ---------------
- * Opens a .sdsh script file and executes it line by line.
- * No interactive prompt is shown.
+ * Opens a script file and executes it line by line. No interactive prompt
+ * is shown. Any filename/extension is accepted (.sdsh, .dsh, .sh, or none
+ * at all) — sdsh doesn't inspect the extension, it just reads lines.
+ *
+ * `must_exist` controls what happens if the file can't be opened:
+ *   1 (true)  — this is a user-requested script (e.g. `sdsh myscript.sh`).
+ *               Print an error and exit(EXIT_FAILURE), just like before.
+ *   0 (false) — this is an optional config file (~/.sdshrc). A missing
+ *               file is not an error; silently return and carry on.
+ * Any *other* open failure (permission denied, etc.) is still reported to
+ * stderr either way, since that usually indicates something worth knowing
+ * about even for an optional rc file — it just isn't fatal when optional.
  */
-static void sdsh_run_script(const char *path)
+static void sdsh_run_script(const char *path, int must_exist)
 {
     FILE *fp = fopen(path, "r");
     if (!fp) {
+        if (!must_exist && errno == ENOENT) {
+            /* Optional config file simply doesn't exist — that's fine. */
+            return;
+        }
         fprintf(stderr,
-            COL_RED "sdsh: cannot open script '%s': %s\n" COL_RESET,
-            path, strerror(errno));
-        exit(EXIT_FAILURE);
+            COL_RED "sdsh: cannot open %s '%s': %s\n" COL_RESET,
+            must_exist ? "script" : "config file", path, strerror(errno));
+        if (must_exist)
+            exit(EXIT_FAILURE);
+        return;
     }
 
     char   *line = NULL;
@@ -616,6 +714,33 @@ static void sdsh_run_script(const char *path)
 
     free(line);
     fclose(fp);
+}
+
+/*
+ * sdsh_load_rc
+ * ------------
+ * Sources ~/.sdshrc (if it exists) before the shell starts doing real
+ * work — same idea as .bashrc/.zshrc. Runs for both interactive and
+ * script-mode invocations unless --norc was passed on the command line.
+ * A missing ~/.sdshrc is completely normal and produces no output.
+ */
+static void sdsh_load_rc(void)
+{
+    const char *home = getenv("HOME");
+    if (!home || *home == '\0') {
+        struct passwd *pw = getpwuid(getuid());
+        home = (pw && pw->pw_dir) ? pw->pw_dir : NULL;
+    }
+
+    if (!home)
+        return;   /* No known home directory — nothing to source. */
+
+    char rc_path[SDSH_CWD_MAX];
+    int written = snprintf(rc_path, sizeof(rc_path), "%s/.sdshrc", home);
+    if (written < 0 || (size_t)written >= sizeof(rc_path))
+        return;   /* Path too long to build safely — skip silently. */
+
+    sdsh_run_script(rc_path, /* must_exist = */ 0);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -691,12 +816,41 @@ int main(int argc, char *argv[])
     sa.sa_flags = SA_RESTART;
     sigaction(SIGINT, &sa, NULL);
 
+    /* ── Parse arguments ───────────────────────────────────────────────────
+     * Recognized forms:
+     *   sdsh                    → interactive REPL
+     *   sdsh script.sdsh        → run script.sdsh (or .dsh/.sh/anything)
+     *   sdsh --norc             → interactive REPL, skip ~/.sdshrc
+     *   sdsh script.sh --norc   → run script.sh, skip ~/.sdshrc
+     * (--norc may appear before or after the script path)
+     */
+    int norc = 0;
+    const char *script_path = NULL;
+
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--norc") == 0) {
+            norc = 1;
+        } else if (script_path == NULL) {
+            script_path = argv[i];
+        }
+        /* Extra stray arguments beyond one script path are ignored. */
+    }
+
+    /* ── Source ~/.sdshrc (unless suppressed) ─────────────────────────────
+     * Runs before both the REPL and script mode, same as a shell's rc
+     * file — handy for a startup `cd`, custom banner, etc. Missing file
+     * is not an error.
+     */
+    if (!norc)
+        sdsh_load_rc();
+
     /* ── Dispatch: script mode or interactive mode ───────────────────────── */
-    if (argc >= 2) {
-        /* A file path was provided as the first argument → script mode */
-        sdsh_run_script(argv[1]);
+    if (script_path != NULL) {
+        /* A file path was provided → script mode. Any extension is fine;
+         * sdsh just reads the file line-by-line (.sdsh, .dsh, .sh, ...). */
+        sdsh_run_script(script_path, /* must_exist = */ 1);
     } else {
-        /* No argument → interactive REPL */
+        /* No script argument → interactive REPL */
         sdsh_repl();
     }
 
