@@ -170,7 +170,7 @@ static void sdsh_print_about(void)
         COL_RESET
         COL_BLUE
         "\n"
-        "   A lightweight custom shell for Ubuntu & KDE Neon.\n"
+        "   A lightweight shell for UNIX like systems.\n"
         "   Talks directly to the Linux kernel (fork/exec/wait).\n"
         "\n"
         "   ── File & Directory Commands ──────────────────────────\n"
